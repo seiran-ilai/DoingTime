@@ -121,8 +121,15 @@ export function calcSettlement({ kind, guards, items, rates = null }) {
   const custOf = it => it._customer
   const waived = waivedEntryCustomers(items, custOf)
   const waiveTotal = items.reduce((s, it) => s + itemEntryWaive(it, waived, custOf), 0)   // 入場費折抵合計
-  const tipTotal = items.filter(x => x.item_type === 'tip').reduce((s, x) => s + (x.amount || 0), 0)   // 小費合計(全額進獎金池)
-  const revenue = items.reduce((s, it) => s + (it.amount || 0), 0) - waiveTotal   // 折抵後實際營業額(已含小費)
+  // 小費:指定獄卒→全給該獄卒(算營收、進該獄卒直接薪資);不指定→全額進均分獎金池。
+  const tipPool = items.filter(x => x.item_type === 'tip' && !x.target_guard_id).reduce((s, x) => s + (x.amount || 0), 0)
+  const tipTotalAll = items.filter(x => x.item_type === 'tip').reduce((s, x) => s + (x.amount || 0), 0)
+  // 追加薪資:監獄額外發給獄卒(非客人營收)。指定→該獄卒;全體(無 target)→均分。從監獄留存扣除,不計營業額。
+  const bonusItems = items.filter(x => x.item_type === 'bonus')
+  const bonusByGuard = {}; let bonusAll = 0
+  for (const b of bonusItems) { if (b.target_guard_id) bonusByGuard[b.target_guard_id] = (bonusByGuard[b.target_guard_id] || 0) + (b.amount || 0); else bonusAll += (b.amount || 0) }
+  const bonusTotal = Object.values(bonusByGuard).reduce((s, v) => s + v, 0) + bonusAll
+  const revenue = items.reduce((s, it) => s + (it.amount || 0), 0) - waiveTotal - bonusTotal   // 折抵後營業額(含小費,排除追加薪資)
 
   const perGuard = guards.map(g => {
     const its = byGuard[g.id] ?? []
@@ -160,6 +167,10 @@ export function calcSettlement({ kind, guards, items, rates = null }) {
       if (supervises.length) { const a = R.supervise * supervises.length; segments.push({ title: '指定監督', amount: a, rows: countRows(supervises, R.supervise) }); direct += a }
       if (visits.length) { const a = R.visit * visits.length; segments.push({ title: '互動探監', amount: a, rows: visits.map(x => ({ name: `${x.visitor_name || '?'} → ${x.person_name || '?'}`, amount: R.visit })) }); direct += a }
     }
+    // 指定小費:全額進該獄卒直接薪資(額外加項,不影響底薪補足)
+    const tipDirect = its.filter(x => x.item_type === 'tip')
+    const tipDirectAmt = tipDirect.reduce((s, x) => s + (x.amount || 0), 0)
+    if (tipDirectAmt) { segments.push({ title: '追加小費', note: '指定', amount: tipDirectAmt, rows: tipDirect.map(t => ({ name: t._customer || '（未指定）', amount: t.amount || 0 })) }); direct += tipDirectAmt }
     return { id: g.id, name: g.name, inmate_no: g.inmate_no, direct, pool: 0, final: direct, segments }
   })
 
@@ -182,23 +193,28 @@ export function calcSettlement({ kind, guards, items, rates = null }) {
     const p = sumType('polaroid'); if (p) revenueRows.push({ label: '拍立得', amount: p })
     const po = sumType('portrait'); if (po) revenueRows.push({ label: '肖像畫', amount: po })
   }
-  if (tipTotal) revenueRows.push({ label: '小費', amount: tipTotal })
+  if (tipTotalAll) revenueRows.push({ label: '小費', amount: tipTotalAll })
 
-  // 集體趕稿 / 指名互動 皆有均分獎金:淨收入(不含小費)50% 均分給出勤獄卒、50% 監獄留存;
-  // 小費全額進獎金池均分給出勤獄卒(監獄不留存小費),於各獄卒卡上另列「追加小費」。
-  const net = revenue - directTotal
-  const nonTipNet = net - tipTotal                              // 淨收扣除小費
-  const basePool = nonTipNet > 0 ? nonTipNet * R.poolRate : 0   // 淨收為負時不發獎金(不倒扣獄卒);監獄留存吸收負值
-  const pool = basePool + tipTotal                             // 均分獎金池 = 淨收 50% + 全額小費
+  // 均分獎金:淨收入(不含不指定小費)50% 均分給出勤獄卒、50% 監獄留存。
+  // 不指定小費全額進獎金池均分(監獄不留存);指定小費已於上方進該獄卒直接薪資。
+  // 追加薪資(監獄發給獄卒):指定→該獄卒;全體→均分。加到最終薪資、從監獄留存扣除。
+  const net = revenue - directTotal                            // directTotal 已含指定小費
+  const nonTipNet = net - tipPool                              // 不指定小費從 50/50 拆分抽出(全額進池)
+  const basePool = nonTipNet > 0 ? nonTipNet * R.poolRate : 0  // 淨收為負時不發獎金(不倒扣獄卒);監獄留存吸收負值
+  const pool = basePool + tipPool                             // 均分獎金池 = 淨收 50% + 全額不指定小費
   const perBasePool = guards.length ? basePool / guards.length : 0
-  const perTip = guards.length ? tipTotal / guards.length : 0
-  const perPool = perBasePool + perTip
-  const retain = nonTipNet - basePool                          // 監獄留存(不含小費)
+  const perTipPool = guards.length ? tipPool / guards.length : 0
+  const perBonusAll = guards.length ? bonusAll / guards.length : 0
+  const perPool = perBasePool + perTipPool
+  const retain = nonTipNet - basePool - bonusTotal            // 監獄留存(不含小費;扣掉追加薪資)
   perGuard.forEach(g => {
     g.pool = perPool; g.final = g.direct + perPool
     if (perBasePool) g.segments.push({ title: '均分獎金', note: `淨收 50% ÷ ${guards.length} 人`, amount: perBasePool })
-    if (perTip) g.segments.push({ title: '追加小費', note: `小費均分 ÷ ${guards.length} 人`, amount: perTip })
+    if (perTipPool) g.segments.push({ title: '追加小費', note: `均分 ÷ ${guards.length} 人`, amount: perTipPool })
+    const bd = bonusByGuard[g.id] || 0
+    if (bd) { g.segments.push({ title: '追加薪資', note: '指定', amount: bd }); g.final += bd }
+    if (perBonusAll) { g.segments.push({ title: '追加薪資', note: `全體均分 ÷ ${guards.length} 人`, amount: perBonusAll }); g.final += perBonusAll }
   })
   const salaryTotal = perGuard.reduce((s, g) => s + g.final, 0)
-  return { kind, revenue, directTotal, net, pool, perPool, retain, salaryTotal, revenueRows, guards: perGuard, tipTotal, waiveTotal }
+  return { kind, revenue, directTotal, net, pool, perPool, retain, salaryTotal, revenueRows, guards: perGuard, tipTotal: tipTotalAll, bonusTotal, waiveTotal }
 }
