@@ -77,6 +77,13 @@ function countRows(items, unit) {
   }))
 }
 
+// 一列細項 { name, tag?, calc?, amount } → 純文字(對齊畫面:名字〔標籤〕算式 金額)
+function payslipRow(r) {
+  const tag = r.tag ? `〔${r.tag}〕` : ''
+  const calc = r.calc ? ` ${r.calc}` : ''
+  return `${r.name}${tag}${calc} ${money(r.amount)}`
+}
+
 // 單一獄卒今日薪資明細 → 純文字(Discord 播報用)。輸入 calcSettlement 產出的一位 guard + 場次資訊。
 // 純文字,分隔沿用「｜」分欄位;每段一行,末行最終薪資。
 export function formatGuardPayslip(guard, session = {}) {
@@ -88,6 +95,7 @@ export function formatGuardPayslip(guard, session = {}) {
   ]
   for (const seg of guard.segments ?? []) {
     lines.push(`· ${seg.title}${seg.note ? `（${seg.note}）` : ''} ${money(seg.amount)}`)
+    for (const r of seg.rows ?? []) lines.push(`　- ${payslipRow(r)}`)   // 細項(對齊畫面每段展開的明細列)
   }
   lines.push(`最終薪資 ${money(guard.final)}`)
   return lines.join('\n')
