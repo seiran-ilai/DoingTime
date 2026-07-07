@@ -34,6 +34,28 @@ const arr = v => Array.isArray(v) ? v : []
 export const w = n => String(Math.round((Number(n) || 0) * 100) / 100)
 export const money = n => `${w(n)} 萬`
 
+// 入場費折抵:同一犯人(本場)若同時有『無指名入場』與『拍立得或指名』,其入場費折抵 ENTRY_WAIVE 萬(至多折到 0)。
+// custOf(it) 取本單犯人識別(名稱);SessionPOS 與薪資結算共用,確保營業額/薪資一致。
+export const ENTRY_WAIVE = 1
+export function waivedEntryCustomers(items, custOf) {
+  const entryOf = new Set(), paidOf = new Set()
+  for (const it of items) {
+    const c = custOf(it); if (!c) continue
+    if (it.item_type === 'entry') entryOf.add(c)
+    else if (it.item_type === 'polaroid' || it.item_type === 'nominate') paidOf.add(c)
+  }
+  const s = new Set()
+  for (const c of entryOf) if (paidOf.has(c)) s.add(c)
+  return s
+}
+// 單一 item 的入場費折抵額(僅 entry 品項、且該犯人符合條件時 > 0)
+export function itemEntryWaive(it, waivedSet, custOf) {
+  if (it.item_type !== 'entry') return 0
+  const c = custOf(it)
+  if (!c || !waivedSet.has(c)) return 0
+  return Math.min(ENTRY_WAIVE, it.amount || 0)
+}
+
 // 拍立得明細列:依「本單犯人」分組,回傳 { name, tag, calc, amount }
 function polaroidRows(items, signed, unit) {
   const groups = {}
@@ -96,7 +118,11 @@ export function calcSettlement({ kind, guards, items, rates = null }) {
   for (const [k, v] of Object.entries(rates ?? {})) if (v != null) R[k] = v
   const byGuard = {}
   for (const it of items) { const g = it.target_guard_id; if (!g) continue; (byGuard[g] ??= []).push(it) }
-  const revenue = items.reduce((s, it) => s + (it.amount || 0), 0)
+  const custOf = it => it._customer
+  const waived = waivedEntryCustomers(items, custOf)
+  const waiveTotal = items.reduce((s, it) => s + itemEntryWaive(it, waived, custOf), 0)   // 入場費折抵合計
+  const tipTotal = items.filter(x => x.item_type === 'tip').reduce((s, x) => s + (x.amount || 0), 0)   // 小費合計(全額進獎金池)
+  const revenue = items.reduce((s, it) => s + (it.amount || 0), 0) - waiveTotal   // 折抵後實際營業額(已含小費)
 
   const perGuard = guards.map(g => {
     const its = byGuard[g.id] ?? []
@@ -152,20 +178,27 @@ export function calcSettlement({ kind, guards, items, rates = null }) {
     const po = sumType('portrait'); if (po) revenueRows.push({ label: '肖像畫', amount: po })
   } else {
     const nom = sumType('nominate'); if (nom) revenueRows.push({ label: '指名費', amount: nom })
-    const e = sumType('entry'); if (e) revenueRows.push({ label: '無指名入場', amount: e })
+    const e = sumType('entry') - waiveTotal; if (e) revenueRows.push({ label: waiveTotal ? '無指名入場（折抵後）' : '無指名入場', amount: e })
     const p = sumType('polaroid'); if (p) revenueRows.push({ label: '拍立得', amount: p })
     const po = sumType('portrait'); if (po) revenueRows.push({ label: '肖像畫', amount: po })
   }
+  if (tipTotal) revenueRows.push({ label: '小費', amount: tipTotal })
 
-  // 集體趕稿 / 指名互動 皆有均分獎金:淨收入 50% 均分給出勤獄卒、50% 監獄留存
+  // 集體趕稿 / 指名互動 皆有均分獎金:淨收入(不含小費)50% 均分給出勤獄卒、50% 監獄留存;
+  // 小費全額進獎金池均分給出勤獄卒(監獄不留存小費),於各獄卒卡上另列「追加小費」。
   const net = revenue - directTotal
-  const pool = net > 0 ? net * R.poolRate : 0   // 淨收為負時不發獎金(獎金 0,不倒扣獄卒);監獄留存吸收負值
-  const perPool = guards.length ? pool / guards.length : 0
-  const retain = net - pool
+  const nonTipNet = net - tipTotal                              // 淨收扣除小費
+  const basePool = nonTipNet > 0 ? nonTipNet * R.poolRate : 0   // 淨收為負時不發獎金(不倒扣獄卒);監獄留存吸收負值
+  const pool = basePool + tipTotal                             // 均分獎金池 = 淨收 50% + 全額小費
+  const perBasePool = guards.length ? basePool / guards.length : 0
+  const perTip = guards.length ? tipTotal / guards.length : 0
+  const perPool = perBasePool + perTip
+  const retain = nonTipNet - basePool                          // 監獄留存(不含小費)
   perGuard.forEach(g => {
     g.pool = perPool; g.final = g.direct + perPool
-    if (perPool) g.segments.push({ title: '均分獎金', note: `淨收 50% ÷ ${guards.length} 人`, amount: perPool })
+    if (perBasePool) g.segments.push({ title: '均分獎金', note: `淨收 50% ÷ ${guards.length} 人`, amount: perBasePool })
+    if (perTip) g.segments.push({ title: '追加小費', note: `小費均分 ÷ ${guards.length} 人`, amount: perTip })
   })
   const salaryTotal = perGuard.reduce((s, g) => s + g.final, 0)
-  return { kind, revenue, directTotal, net, pool, perPool, retain, salaryTotal, revenueRows, guards: perGuard }
+  return { kind, revenue, directTotal, net, pool, perPool, retain, salaryTotal, revenueRows, guards: perGuard, tipTotal, waiveTotal }
 }

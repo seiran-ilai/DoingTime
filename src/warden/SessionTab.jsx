@@ -97,11 +97,18 @@ export default function SessionTab({ currentSession, setCurrentSession, sessions
     window.open(window.location.origin + '/?broadcast=' + sessionId, '_blank', 'width=1280,height=720')
   }
 
-  async function removeFromSession(sessionInmateId) {
-    if (!await askConfirm({ title: '移出本場', message: '確定將這位犯人移出本場？本場目標會一併清除。', confirmLabel: '移出本場', danger: true })) return
-    const { error } = await supabase.from('session_inmates').delete().eq('id', sessionInmateId)
+  async function removeFromSession(row) {
+    if (!await askConfirm({ title: '移出本場', message: '確定將這位犯人移出本場？本場目標會一併清除，其預約也會標記為取消（不會在重新帶入名單時再出現）。', confirmLabel: '移出本場', danger: true })) return
+    // 移出本場 = 取消預約:先把同場同人(user_id=member_id)的預約標記 cancelled,避免「開始服刑」重新帶入名單時又出現
+    if (row.member_id) {
+      const { error: bErr } = await supabase.from('bookings')
+        .update({ status: 'cancelled' })
+        .eq('session_id', currentSession).eq('user_id', row.member_id).neq('status', 'cancelled')
+      if (bErr) { setMsg('取消預約失敗：' + bErr.message); return }
+    }
+    const { error } = await supabase.from('session_inmates').delete().eq('id', row.id)
     if (error) { setMsg('移出失敗：' + error.message); return }
-    setMsg('已移出本場'); loadRoster(currentSession)  // 本場目標靠 cascade 自動清
+    setMsg('已移出本場並取消預約'); loadRoster(currentSession)  // 本場目標靠 cascade 自動清
   }
 
   async function toggleGoalStep(step) {
@@ -249,7 +256,7 @@ export default function SessionTab({ currentSession, setCurrentSession, sessions
                       <div className="m-id">No.{String(r.profile?.inmate_no).padStart(4, '0')}</div>
                       <div className="m-nm">{r.profile?.game_name ?? r.profile?.display_name} <span className="faint">（{r.state}）</span></div>
                     </div>
-                    <button className="btn-danger btn-sm spacer" onClick={() => removeFromSession(r.id)}>移出本場</button>
+                    <button className="btn-danger btn-sm spacer" onClick={() => removeFromSession(r)}>移出本場</button>
                   </div>
                   <div className="m-detail">
                     {/* 本場目標 */}

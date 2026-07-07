@@ -216,8 +216,8 @@ export default function SalarySettlement({ currentSession, embedded = false, pos
                     <div className="pb-title">結算</div>
                     <div className="prison-row"><span>獄卒直接薪資</span><Amt v={-result.directTotal} neg /></div>
                     <div className="prison-row sum"><span>淨收入（營業額 − 直接薪資）</span><Amt v={result.net} neg={result.net < 0} /></div>
-                    <div className="prison-row"><span>均分獎金池（淨收 50%，發給獄卒）</span><Amt v={-result.pool} neg /></div>
-                    <div className="prison-row hl"><span>監獄留存（淨收 50%，用於後續活動經費）</span><Amt v={result.retain} neg={result.retain < 0} strong /></div>
+                    <div className="prison-row"><span>均分獎金池（淨收 50%{result.tipTotal ? ' + 全額小費' : ''}，發給獄卒）</span><Amt v={-result.pool} neg /></div>
+                    <div className="prison-row hl"><span>監獄留存（淨收 50%{result.tipTotal ? '，不含小費' : ''}，用於後續活動經費）</span><Amt v={result.retain} neg={result.retain < 0} strong /></div>
                   </div>
                 </div>
                 <p className="settle-note">資料來源 POS 結帳（pos_order_items）。金額單位「萬」。此頁僅計算顯示，不寫入。</p>

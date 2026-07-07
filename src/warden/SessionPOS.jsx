@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo } from 'react'
 import { supabase } from '../supabaseClient'
 import { slotLabel } from '../slots'
 import { fetchPriceRows, priceMap, effPrice, hasSale, DEFAULT_PRICES } from '../prices'
+import { waivedEntryCustomers, itemEntryWaive } from './salaryRules'
 
 // 進行中場次 統一 POS 開單:選品項(chip)→ 該品項專屬細節 → 加入本單(購物車)→ 一次結帳寫入營業額。
 // 取代舊「走查加購 / 臨時追加犯人 / 探監登錄」三個攤開表單。
@@ -12,11 +13,11 @@ import { fetchPriceRows, priceMap, effPrice, hasSale, DEFAULT_PRICES } from '../
 // 結帳寫 pos_orders(paid=true)+ pos_order_items;臨時指定時格另寫 guard_slot_bookings。金額單位:萬。
 // 價格來自 price_items 價目表(定價/優惠價;未建表退回內建預設):
 //   有優惠價的品項可於細節選「以定價結帳」;購物車內金額可手動調整,低於定價即記錄為優惠(list_amount=定價金額)。
-const ITEM_LABEL = { signup: '臨時報名', visit: '互動探監', polaroid: '拍立得', portrait: '肖像畫', nominate: '臨時指定', entry: '無指名入場' }
+const ITEM_LABEL = { signup: '臨時報名', visit: '互動探監', polaroid: '拍立得', portrait: '肖像畫', nominate: '臨時指定', entry: '無指名入場', tip: '小費' }
 const arr = v => Array.isArray(v) ? v : []
 const money = n => `${n} 萬`
 
-const EMPTY_D = { person_name: '', target_guard_id: '', qty: 1, with_signature: false, visitor_name: '', message: '', interaction_note: '', supervise: false, slot_times: [], assign_guard_id: '', useList: false }
+const EMPTY_D = { person_name: '', target_guard_id: '', qty: 1, with_signature: false, visitor_name: '', message: '', interaction_note: '', supervise: false, slot_times: [], assign_guard_id: '', useList: false, tip_amount: '' }
 
 export default function SessionPOS({ session, inmates, setMsg, onPosChange }) {
   const sid = session?.id
@@ -35,6 +36,8 @@ export default function SessionPOS({ session, inmates, setMsg, onPosChange }) {
   const [cart, setCart] = useState([])         // 本單購物車
   const [busy, setBusy] = useState(false)
   const [confirmDel, setConfirmDel] = useState(null) // 待確認刪除的 item id(inline 確認,不用 window.confirm)
+  const [editing, setEditing] = useState(null)       // 編輯中的 item id(今日營業總表 inline 編輯)
+  const [edit, setEdit] = useState({})               // 編輯草稿 { customer, note, qty, target_guard_id, amount }
   const [sortKey, setSortKey] = useState(null)       // 今日營業總表排序欄(null=依結帳時間)
   const [sortDir, setSortDir] = useState('desc')
   const [onlyUndone, setOnlyUndone] = useState(false) // 只顯示未完成
@@ -87,8 +90,8 @@ export default function SessionPOS({ session, inmates, setMsg, onPosChange }) {
   const portraitGuards = useMemo(() => guards.filter(g => g.portrait_only), [guards])
   const hasPortrait = portraitGuards.length > 0
   const chips = kind === 'named'
-    ? [['nominate', false], ['entry', false], ['polaroid', false], ['portrait', !hasPortrait]]
-    : [['signup', false], ['visit', false], ['polaroid', false], ['portrait', !hasPortrait]]
+    ? [['nominate', false], ['entry', false], ['polaroid', false], ['portrait', !hasPortrait], ['tip', false]]
+    : [['signup', false], ['visit', false], ['polaroid', false], ['portrait', !hasPortrait], ['tip', false]]
 
   // 某獄卒剩餘可接時格(排班可指名 − 占用 − 本單已選)
   const cartSlotKeys = new Set(cart.flatMap(c => c.item_type === 'nominate' ? arr(c.slot_times).map(s => `${c.target_guard_id}|${s}`) : []))
@@ -105,7 +108,7 @@ export default function SessionPOS({ session, inmates, setMsg, onPosChange }) {
   // 各品項牽涉的價目鍵(判斷是否出現「以定價結帳」選項)
   const PICK_KEYS = {
     signup: ['signup', 'supervise'], visit: ['visit'], polaroid: ['polaroid', 'sign'],
-    portrait: ['portrait'], nominate: ['nominate'], entry: ['entry'],
+    portrait: ['portrait'], nominate: ['nominate'], entry: ['entry'], tip: [],
   }
   const pickHasSale = pick ? (PICK_KEYS[pick] ?? []).some(k => hasSale(prow(k))) : false
 
@@ -148,6 +151,12 @@ export default function SessionPOS({ session, inmates, setMsg, onPosChange }) {
       case 'entry':
         if (!cust) return { err: '請先填犯人名稱' }
         return { line: { item_type: 'entry', person_name: cust, amount: P('entry', u), list_amount: P('entry', true) } }
+      case 'tip': {
+        // 小費:客人額外給予,金額自由輸入;全額進均分獎金池(對象獄卒僅記錄用)。
+        const amt = Math.max(0, Number(d.tip_amount) || 0)
+        if (!amt) return { err: '請輸入小費金額' }
+        return { line: { item_type: 'tip', person_name: cust || null, target_guard_id: d.target_guard_id || null, amount: amt, list_amount: amt } }
+      }
       default:
         return { err: '' }
     }
@@ -234,7 +243,38 @@ export default function SessionPOS({ session, inmates, setMsg, onPosChange }) {
     else onPosChange?.()   // 通知薪資結算重算
   }
 
-  const salesTotal = items.reduce((s, x) => s + (x.amount || 0), 0)
+  // 今日營業總表:單列 inline 編輯(下單人/明細數量/對象獄卒/金額/本單備註)
+  function startEdit(it) {
+    const ord = ordersById[it.order_id] || {}
+    setConfirmDel(null)
+    setEditing(it.id)
+    setEdit({ customer: ord.customer_name ?? it.person_name ?? '', note: ord.note ?? '', qty: it.qty ?? 1, target_guard_id: it.target_guard_id ?? '', amount: it.amount ?? 0 })
+  }
+  async function saveEdit(it) {
+    const ord = ordersById[it.order_id] || {}
+    const newCust = edit.customer.trim() || null
+    const newNote = edit.note.trim() || null
+    const itemPatch = { amount: Math.max(0, Number(edit.amount) || 0), target_guard_id: edit.target_guard_id || null }
+    if (it.item_type === 'polaroid') itemPatch.qty = Math.max(1, Math.min(99, parseInt(edit.qty) || 1))
+    if (it.person_name != null) itemPatch.person_name = newCust   // 以 person_name 為對象的品項一併同步下單人
+    const orderPatch = {}
+    if (newCust !== (ord.customer_name ?? null)) orderPatch.customer_name = newCust
+    if (newNote !== (ord.note ?? null)) orderPatch.note = newNote
+    // 樂觀更新本地
+    setItems(prev => prev.map(x => x.id === it.id ? { ...x, ...itemPatch } : x))
+    if (Object.keys(orderPatch).length) setOrdersById(prev => ({ ...prev, [it.order_id]: { ...(prev[it.order_id] || {}), ...orderPatch } }))
+    setEditing(null)
+    const { error: e1 } = await supabase.from('pos_order_items').update(itemPatch).eq('id', it.id)
+    let e2 = null
+    if (Object.keys(orderPatch).length) ({ error: e2 } = await supabase.from('pos_orders').update(orderPatch).eq('id', it.order_id))
+    if (e1 || e2) { setMsg('儲存失敗：' + (e1 || e2).message); load() }   // 失敗才重載回滾
+    else onPosChange?.()   // 通知薪資結算重算
+  }
+
+  // 入場費折抵:同一犯人(本場)有無指名入場 + 拍立得/指名 → 入場費折抵 1 萬(動態計算,與薪資結算一致)
+  const custKeyOf = (it) => (it.person_name || ordersById[it.order_id]?.customer_name || '').trim()
+  const waivedEntry = useMemo(() => waivedEntryCustomers(items, custKeyOf), [items, ordersById])
+  const salesTotal = items.reduce((s, x) => s + (x.amount || 0) - itemEntryWaive(x, waivedEntry, custKeyOf), 0)
 
   // 該筆是否「已完成」:所有適用的核對項(互動/合照/拍立得)都勾了;無核對項的品項視為已完成
   const itemDone = (it) => {
@@ -349,6 +389,15 @@ export default function SessionPOS({ session, inmates, setMsg, onPosChange }) {
                 )}
               </>)}
               {pick === 'entry' && <p className="muted">無額外欄位，直接加入本單（{P('entry', d.useList)} 萬）。</p>}
+              {pick === 'tip' && (<>
+                <div className="pos-fld"><span>小費金額</span>
+                  <input className="inp" type="number" min="0" style={{ width: 100 }} value={d.tip_amount} onChange={e => setD({ ...d, tip_amount: e.target.value })} placeholder="萬" /></div>
+                <div className="pos-fld"><span>對象獄卒</span>
+                  <select className="sel" value={d.target_guard_id} onChange={e => setD({ ...d, target_guard_id: e.target.value })}>
+                    <option value="">不指定</option>{onDuty.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}
+                  </select></div>
+                <p className="muted">小費全額進均分獎金池，均分給全體上班獄卒（監獄不留存）。對象獄卒僅供記錄。</p>
+              </>)}
 
               {/* 品項有優惠價時可選以優惠價或定價結帳(預設優惠價) */}
               {pickHasSale && (
@@ -436,22 +485,41 @@ export default function SessionPOS({ session, inmates, setMsg, onPosChange }) {
                   const cell = (app, field) => app
                     ? <input type="checkbox" checked={!!it[field]} onChange={() => toggleStatus(it, field)} />
                     : <span className="faint">—</span>
+                  const isEdit = editing === it.id
+                  const waive = itemEntryWaive(it, waivedEntry, custKeyOf)
+                  const effAmount = (it.amount || 0) - waive
                   return (
-                    <tr key={it.id}>
-                      <td className="g-name">{customerName}</td>
+                    <tr key={it.id} className={isEdit ? 'pos-editing' : ''}>
+                      <td className="g-name">{isEdit
+                        ? <input className="inp" style={{ width: 110 }} value={edit.customer} onChange={e => setEdit({ ...edit, customer: e.target.value })} />
+                        : customerName}</td>
                       <td className="g-name">{ITEM_LABEL[it.item_type] ?? it.item_type}</td>
-                      <td>{detail}</td>
-                      <td>{it.target_guard_id ? guardName(it.target_guard_id) : '—'}</td>
-                      <td>{money(it.amount)}
-                        {it.list_amount != null && Number(it.list_amount) > (it.amount || 0) &&
-                          <div className="pos-off-tag">優惠（定價 {money(Number(it.list_amount))}）</div>}</td>
+                      <td>{isEdit && it.item_type === 'polaroid'
+                        ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>×<input className="inp" type="number" min="1" max="99" style={{ width: 56 }} value={edit.qty} onChange={e => setEdit({ ...edit, qty: e.target.value })} />{it.with_signature ? ' 含簽繪' : ''}</span>
+                        : detail}</td>
+                      <td>{isEdit
+                        ? <select className="sel" value={edit.target_guard_id} onChange={e => setEdit({ ...edit, target_guard_id: e.target.value })}>
+                            <option value="">—</option>{guards.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}
+                          </select>
+                        : (it.target_guard_id ? guardName(it.target_guard_id) : '—')}</td>
+                      <td>{isEdit
+                        ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><input className="inp" type="number" min="0" style={{ width: 72 }} value={edit.amount} onChange={e => setEdit({ ...edit, amount: e.target.value })} /> 萬</span>
+                        : <>{money(effAmount)}
+                            {waive > 0
+                              ? <div className="pos-off-tag">入場費折抵（原 {money(it.amount)}）</div>
+                              : (it.list_amount != null && Number(it.list_amount) > (it.amount || 0) &&
+                                <div className="pos-off-tag">優惠（定價 {money(Number(it.list_amount))}）</div>)}</>}</td>
                       <td>{cell(appInteract, 'status_interact')}</td>
                       <td>{cell(appPhoto, 'status_photo')}</td>
                       <td>{cell(appPolaroid, 'status_polaroid')}</td>
-                      <td className="faint">{ord.note || '—'}</td>
-                      <td>{confirmDel === it.id
-                        ? <span style={{ display: 'inline-flex', gap: 4 }}><button className="btn-sm btn-danger" onClick={() => removeItem(it)}>確認</button><button className="btn-sm" onClick={() => setConfirmDel(null)}>取消</button></span>
-                        : <button className="btn-sm btn-danger" onClick={() => setConfirmDel(it.id)}>刪</button>}</td>
+                      <td className="faint">{isEdit
+                        ? <input className="inp" style={{ width: 110 }} value={edit.note} onChange={e => setEdit({ ...edit, note: e.target.value })} />
+                        : (ord.note || '—')}</td>
+                      <td>{isEdit
+                        ? <span style={{ display: 'inline-flex', gap: 4 }}><button className="btn-sm btn-pri" onClick={() => saveEdit(it)}>儲存</button><button className="btn-sm" onClick={() => setEditing(null)}>取消</button></span>
+                        : confirmDel === it.id
+                          ? <span style={{ display: 'inline-flex', gap: 4 }}><button className="btn-sm btn-danger" onClick={() => removeItem(it)}>確認</button><button className="btn-sm" onClick={() => setConfirmDel(null)}>取消</button></span>
+                          : <span style={{ display: 'inline-flex', gap: 4 }}><button className="btn-sm" onClick={() => startEdit(it)}>編輯</button><button className="btn-sm btn-danger" onClick={() => setConfirmDel(it.id)}>刪</button></span>}</td>
                     </tr>
                   )
                 })}
